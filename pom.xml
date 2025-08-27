@@ -4,14 +4,6 @@
   <artifactId>vt-scheduler</artifactId>
   <version>0.1</version>
   
-  	<parent> <!--TODO DEBUG-->
-		<groupId>org.springframework.boot</groupId>
-		<artifactId>spring-boot-starter-parent</artifactId>
-		<version>3.3.1</version>
-		<relativePath />
-	</parent>
-
-  
   	<properties>
 		<maven.compiler.release>21</maven.compiler.release>
 	</properties>
