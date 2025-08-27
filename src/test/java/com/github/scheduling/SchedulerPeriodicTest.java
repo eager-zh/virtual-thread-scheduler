@@ -32,7 +32,8 @@ public class SchedulerPeriodicTest {
 	private ScheduledExecutorService getScheduler() {
 		return new ThreadPerTaskScheduledExecutorService();
 		// may want to compare with 
-		//Executors.newScheduledThreadPool(Integer.MAX_VALUE, Thread.ofVirtual().factory());
+		// Executors.newScheduledThreadPool(Integer.MAX_VALUE, Thread.ofVirtual().factory());
+		// in order to make sure that ScheduledExecutorService contract is fulfilled
 	}
 	
 	// Success

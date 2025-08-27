@@ -27,10 +27,6 @@ import java.util.function.Consumer;
  * {@link java.util.concurrent.ThreadPerTaskExecutor ThreadPerTaskExecutor}. 
  * Threads are removed from the thread list upon their completion.
  * 
- * <p/> Once submitted, the tasks are placed into a {@link DelayQueue}, where from they are read by a dedicated 
- * {@link ThreadPerTaskScheduledExecutorService.QueueReader QueueReader} thread. 
- * It is terminated upon the invocation of {@link #shutdown()} or {@link #shutdownNow()} methods.
- * 
  * <p/> While {@link #ThreadPerTaskScheduledExecutorService(ExecutorService)} constructor accepts arbitrary 
  * implementation of {@link ExecutorService}, only non-pooling, thread-per-task implementations 
  * will make sense because otherwise 
@@ -38,14 +34,16 @@ import java.util.function.Consumer;
  * 
  * <p> <strong>Implementation details:</strong>
  * <ul>
- * <li>task submission is delegated to {@code ThreadPerTaskExecutor} implementation of {@link ExecutorService};</li> 
+ * <li>task submission is delegated to {@link java.util.concurrent.ThreadPerTaskExecutor ThreadPerTaskExecutor}
+ * implementation of {@link ExecutorService};</li> 
  * <li>scheduling is organized by the means of stock {@link DelayQueue};</li>
  * <li>{@link Runnable} task is wrapped into a specialized subclass of {@link FutureTask}
  * which implements {@link Delayed} interface; 
  * almost all functionality, related to completion, exception/failure, cancellation etc 
  * is delegated to the base class; upon submission an instance of this class is placed into the queue;</li>
- * <li>special dedicated (daemon) thread takes the task instances from the queue 
- * and submits them to inner {@link ExecutorService}; this thread gets killed upon Service shutdown or closure;</li>
+ * <li>special dedicated (daemon) thread {@link ThreadPerTaskScheduledExecutorService.QueueReader QueueReader} 
+ * takes the task instances from the queue 
+ * and submits them to inner {@link ExecutorService}; this thread gets killed upon Service's shutdown or closure;</li>
  * <li> periodic tasks re-enqueue themselves upon completion, {@link FutureTask#runAndReset} is used 
  * to execute them instead of {@link FutureTask#run}.
  * </ul>

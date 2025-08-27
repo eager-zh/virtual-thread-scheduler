@@ -22,8 +22,9 @@ public class SchedulerTest {
 	private ScheduledExecutorService getScheduler() {
 		return
 			new ThreadPerTaskScheduledExecutorService();
-			// may want to compare with 
-			//Executors.newScheduledThreadPool(Integer.MAX_VALUE, Thread.ofVirtual().factory());
+		// may want to compare with 
+		// Executors.newScheduledThreadPool(Integer.MAX_VALUE, Thread.ofVirtual().factory());
+		// in order to make sure that ScheduledExecutorService contract is fulfilled
 	}
 	
 	private static boolean sleep(long millis) {
