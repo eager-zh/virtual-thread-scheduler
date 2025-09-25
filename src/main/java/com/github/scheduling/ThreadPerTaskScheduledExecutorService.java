@@ -441,7 +441,7 @@ public class ThreadPerTaskScheduledExecutorService implements ScheduledExecutorS
 		
 		@Override
 		public int compareTo(Delayed o) {
-			return o instanceof DelayedTask other ? (int)(triggerTime - other.triggerTime) : 1;
+			return o instanceof DelayedTask other ? Long.signum(triggerTime - other.triggerTime) : 1;
 		}
 
 		@Override
