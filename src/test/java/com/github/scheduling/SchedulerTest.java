@@ -448,6 +448,29 @@ public class SchedulerTest {
 
 		Assert.assertTrue("Scheduled service must terminate", service.awaitTermination(5, TimeUnit.SECONDS));
 	}
+	
+	@Test
+	public void testMultiShutdown() throws InterruptedException, ExecutionException {
+		final ScheduledExecutorService service = getScheduler();
+		final AtomicBoolean isVirtual = new AtomicBoolean();
+		
+		final Future<?> future = service.schedule( ()->  {
+			isVirtual.set(Thread.currentThread().isVirtual());
+			sleep(1000);
+		}, 5, TimeUnit.SECONDS);
+		
+		future.get();
+		
+		Assert.assertTrue("Task must be executed on virtual thread", isVirtual.get());
+		Assert.assertTrue("Future must be done", future.isDone());
+		Assert.assertEquals("Future must be in succeeded state", Future.State.SUCCESS, future.state());
+		Assert.assertFalse("Future must not be cancelled", future.isCancelled());
+		for (int i =0; i < 3; i++ )
+			Thread.ofVirtual().start( () -> {
+				service.shutdown();
+			});
+		Assert.assertTrue("Scheduled service must terminate", service.awaitTermination(1, TimeUnit.SECONDS));
+	}
 
 	@Test
 	public void testShutdownNowActive() throws InterruptedException, ExecutionException {

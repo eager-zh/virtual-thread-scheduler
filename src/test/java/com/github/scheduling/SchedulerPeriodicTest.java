@@ -19,7 +19,6 @@ import org.junit.Test;
 
 public class SchedulerPeriodicTest {
 	
-	
 	private static boolean sleep(long millis) {
 		try {
 			Thread.sleep(millis);
@@ -73,7 +72,7 @@ public class SchedulerPeriodicTest {
 		Assert.assertTrue("Future must be done", future.isDone());
 		Assert.assertEquals("Future must be in cancelled state", Future.State.CANCELLED, future.state());
 	}
-
+	
 	@Test
 	public void testFixedDelaySucceeded() throws InterruptedException, ExecutionException {
 		final ScheduledExecutorService service = getScheduler();
@@ -100,7 +99,7 @@ public class SchedulerPeriodicTest {
 		sleep(10_000);
 
 		service.shutdown();
-		Assert.assertTrue("Scheduled service must terminate", service.awaitTermination(5, TimeUnit.SECONDS));
+		Assert.assertTrue("Scheduled service must terminate", service.awaitTermination(1, TimeUnit.SECONDS));
 
 		Assert.assertEquals("Future is not executed expected amount of times", 3, executionCount.get());
 		Assert.assertTrue("Task must be executed on virtual thread", isVirtual.get());
@@ -299,6 +298,46 @@ public class SchedulerPeriodicTest {
 		}
 
 		Assert.assertTrue("Scheduled service must terminate", service.awaitTermination(5, TimeUnit.SECONDS));
+	}
+	
+	@Test
+	public void testMultiShutdown() throws InterruptedException, ExecutionException {
+		final ScheduledExecutorService service = getScheduler();
+		final AtomicBoolean isVirtual = new AtomicBoolean();
+		final AtomicInteger executionCount = new AtomicInteger();
+		final AtomicBoolean futureReturnedFromGet = new AtomicBoolean();
+		
+		final Future<?> future = service.scheduleAtFixedRate( ()->  {
+			isVirtual.set(Thread.currentThread().isVirtual());
+			executionCount.incrementAndGet();
+			sleep(1000);
+		}, 0, 5, TimeUnit.SECONDS);
+		
+		Thread.ofVirtual().start( () -> {
+			try {
+				future.get();
+				futureReturnedFromGet.set(true);
+			} catch (CancellationException e) {
+			} catch (Exception e) {
+				Assert.fail("Task threw exception " + e);
+			}
+		});
+		
+		sleep(12_000); 
+
+		for (int i =0; i < 3; i++ )
+			Thread.ofVirtual().start( () -> {
+				service.shutdown();
+			});
+
+		Assert.assertTrue("Scheduled service must terminate", service.awaitTermination(5, TimeUnit.SECONDS));
+
+		Assert.assertEquals("Future is not executed expected amount of times", 3, executionCount.get());
+		Assert.assertTrue("Task must be executed on virtual thread", isVirtual.get());
+		Assert.assertTrue("Future must be cancelled", future.isCancelled());
+		Assert.assertFalse("Future should not return from get method", futureReturnedFromGet.get());
+		Assert.assertTrue("Future must be done", future.isDone());
+		Assert.assertEquals("Future must be in cancelled state", Future.State.CANCELLED, future.state());
 	}
 	
 	@Test

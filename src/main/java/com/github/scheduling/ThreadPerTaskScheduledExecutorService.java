@@ -3,7 +3,9 @@ package com.github.scheduling;
 import static java.util.concurrent.TimeUnit.NANOSECONDS;
 
 import java.util.Collection;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.Callable;
 import java.util.concurrent.DelayQueue;
 import java.util.concurrent.Delayed;
@@ -17,7 +19,8 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
-import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.AbstractQueuedSynchronizer;
 import java.util.function.Consumer;
 
 /**
@@ -41,20 +44,287 @@ import java.util.function.Consumer;
  * which implements {@link Delayed} interface; 
  * almost all functionality, related to completion, exception/failure, cancellation etc 
  * is delegated to the base class; upon submission an instance of this class is placed into the queue;</li>
- * <li>special dedicated (daemon) thread {@link ThreadPerTaskScheduledExecutorService.QueueReader QueueReader} 
- * takes the task instances from the queue 
- * and submits them to inner {@link ExecutorService}; this thread gets killed upon Service's shutdown or closure;</li>
+ * <li>internal queue reading tasks are submitted to the inner {@link ExecutorService} upon construction, 
+ * these tasks {@link DelayQueue#take() take} the tasks instances from the queue and submit them to inner {@link ExecutorService},
+ * these internal tasks get killed by means of {@link Thread#interrupt()} upon Service's shutdown or closure;</li>
  * <li> periodic tasks re-enqueue themselves upon completion, {@link FutureTask#runAndReset} is used 
- * to execute them instead of {@link FutureTask#run}.
+ * to execute them instead of {@link FutureTask#run}.</li>
  * </ul>
  *
  */
 public class ThreadPerTaskScheduledExecutorService implements ScheduledExecutorService {
 	
+	/** 
+	 * Synchronizer provides concurrent access to a collection of threads and 
+	 * atomic shutdown. Upon the shutdown via {@link #shutdown()} method,
+	 * each registered thread is interrupted.
+	 * These two tasks are not independent: first, the shutdown process excludes 
+	 * simultaneous access to the collection of threads so that 
+	 * no thread is allowed to be added when shutdown is in progress and, second, 
+	 * only one thread is allowed to interrupt the registered threads.
+	 * 
+	 * <h5>Implementation details</h5>
+	 * 
+	 * <p/>In a very unlikely case of shutdown flag set by other thread between 
+	 * the calls of {@link #isShutdown()} in {@link #shutdown()}  
+	 * and {@link #tryAcquireOnShutdown} methods this thread will be,
+	 * technically unnecessarily, suspended until that other thread completes 
+	 * the shutdown process. Right after receiving a control, this thread will immediately 
+	 * return without execution of shutdown action.
+	 * 
+	 * <p/>Similar strategy applied to a case of thread collection manipulation:
+	 * a thread, which attempts to add a thread to thread collections
+	 * will be suspended if shutdown is in progress. The suspension is not necessary
+	 * because if shutdown is started, no thread registration is allowed and 
+	 * {@link #registerThread(Thread)} method should return {@code false} 
+	 * as soon as possible.
+	 * 
+	 * <p/>The both cases, which cause only insignificant delay, could happen upon 
+	 * quite unlikely thread interleaving.  
+	 * 
+	 * <p/>{@link AbstractQueuedSynchronizer}'s {@code state} field is not used due to limitations
+	 * of {@link AbstractQueuedSynchronizer#compareAndSetState} method, which does not allow
+	 * to get a <i>witness</i> state. Instead {@link AtomicInteger} is used for {@link #state} field, which,
+	 * it seems, does not have any adverse effect, but still increases the size of occupied memory. 
+	 * Thus, effectively, only <i>waitset</i> feature of {@link AbstractQueuedSynchronizer} is used.       
+	 */
+	private static class SchedulerSync extends AbstractQueuedSynchronizer {
+		
+		private static final long serialVersionUID = -4132802382847403450L;
+
+		// Actions
+
+		/**
+		 * A thread is about to be added to {@link #threads} collection.
+		 */
+		private static final int ADD_THREAD_ACTION = 1;
+
+		/**
+		 * A thread is about to be removed from {@link #threads} collection.
+		 */
+		private static final int REMOVE_THREAD_ACTION = 2;
+		
+		/**
+		 * Shutdown is about to be performed.
+		 */
+		private static final int SHUTDOWN_ACTION = 3;
+		
+		
+		// State flags
+		
+		/**
+		 * {@link #threads} collection is locked to avoid 
+		 * {@link ConcurrentModificationException}.
+		 */
+		private static final int THREADS_LOCK_FLAG = 1;
+		
+		/**
+		 * Shutdown has been initiated. Whether it has been completed or not,
+		 * depends on {@link #SHUTDOWN_IN_PROGRESS_FLAG} flag.
+		 */
+		private static final int SHUTDOWN_FLAG = 2;
+
+		/**
+		 * Shutdown has been initiated and is currently in progress.
+		 */
+		private static final int SHUTDOWN_IN_PROGRESS_FLAG = 4;
+		
+		/**
+		 * Denotes a state when no any of above flags is set.
+		 */
+		private static final int EMPTY_STATE = 0;
+		
+		//
+		
+		/**
+		 * Collection of delayed threads. 
+		 * Guarded by the {@link AbstractQueuedSynchronizer}'s 
+		 * acquisition/release framework.
+		 */
+		private final Set<Thread> threads = new HashSet<>(); // 
+		
+		/**
+		 * Overrides the superclass' field, accessible via {@link #setState(int)} and 
+		 * {@link #getState()} methods due to a necessity of employing 
+		 * {@link AtomicInteger}'s compare-and-exchange logic.  
+		 */
+		private final AtomicInteger state = new AtomicInteger();
+	    
+		@Override
+		protected boolean tryAcquire(int action) {
+			if (action == ADD_THREAD_ACTION)
+				return tryAcquireOnThreadAddition();
+			else if (action == REMOVE_THREAD_ACTION)
+				return tryAcquireOnThreadRemoval();
+			else if (action == SHUTDOWN_ACTION)
+				return tryAcquireOnShutdown();
+			else 
+				throw new Error("Unexpected action " + action);
+		}
+		
+		/**
+		 * Acquires if current state is empty, 
+		 * {@link #THREADS_LOCK_FLAG} was set in this case, 
+		 * <b>or</b> shutdown has been completed.
+		 * A caller is supposed to check result of {@link #isShutdown()} 
+		 * to differentiate between these two cases. 
+		 */
+		private boolean tryAcquireOnThreadAddition() {
+			if (state.compareAndSet(EMPTY_STATE, THREADS_LOCK_FLAG))
+				return true;
+			else if (isShutdown())
+				return true;
+			else
+				return false;
+		}
+		
+		/**
+		 * Acquires if current state is empty <b>or</b> 
+		 * shutdown has been completed, {@link #THREADS_LOCK_FLAG} was set in these cases.
+		 */
+		private boolean tryAcquireOnThreadRemoval() {
+			final int expected = isShutdown() ? SHUTDOWN_FLAG : EMPTY_STATE;
+			if (state.compareAndSet(expected, expected | THREADS_LOCK_FLAG))
+				return true;
+			else 
+				return false;
+		}
+		
+		/**
+		 * Acquires if current state is empty, flags {@link #THREADS_LOCK_FLAG},
+		 * {@link #SHUTDOWN_FLAG}, and {@link #SHUTDOWN_IN_PROGRESS_FLAG} are set in this case,
+		 * <b>or</b> shutdown has been fully completed. A caller is supposed to check 
+		 * results of {@link #isShutdown()} and {@link #isShutdown()}
+		 * to differentiate between these two cases. 
+		 */
+		private boolean tryAcquireOnShutdown() {
+			final int witnessState = state.compareAndExchange(EMPTY_STATE, 
+					THREADS_LOCK_FLAG | SHUTDOWN_FLAG | SHUTDOWN_IN_PROGRESS_FLAG);
+			if (witnessState == 0 || 
+					(isShutdown(witnessState) && !isShutdownInProgress(witnessState)))
+				return true;
+			else
+				return false;
+		}
+		
+		@Override
+		protected boolean tryRelease(int action) {
+			if (action == ADD_THREAD_ACTION || action == REMOVE_THREAD_ACTION)
+				return tryReleaseOnThreadAddingOrRemoval();
+			else if (action == SHUTDOWN_ACTION)
+				return tryReleaseOnShutdown();
+			else 
+				throw new Error("Unexpected action " + action);
+		}
+		
+		/**
+		 * Removes {@link #THREADS_LOCK_FLAG} flag. 
+		 * Checks if it was set, and if it was not,
+		 * throws {@link IllegalStateException}.
+		 */
+		private boolean tryReleaseOnThreadAddingOrRemoval() {
+			final int state = this.state.get();
+			final int newState = state & ~THREADS_LOCK_FLAG;
+			if (!this.state.compareAndSet(state, newState))
+				throw new IllegalStateException("Lock hasn't been acquired " + state + " prior to the release");
+			return true;
+		}
+		
+		/**
+		 * Removes {@link #THREADS_LOCK_FLAG} and {@link #SHUTDOWN_IN_PROGRESS_FLAG} flags. 
+		 * Checks if they were set, and if they were not,
+		 * throws {@link IllegalStateException}.
+		 */
+		private boolean tryReleaseOnShutdown() {
+			final int state = this.state.get();
+			final int newState = state & ~(THREADS_LOCK_FLAG | SHUTDOWN_IN_PROGRESS_FLAG);
+			if (!this.state.compareAndSet(state, newState))
+				throw new IllegalStateException("Lock hasn't been acquired " + state + " prior to the release");
+			return true;
+		}
+		
+		public boolean isShutdown() {
+			return isShutdown(state.get());
+		}
+
+		private boolean isShutdownInProgress() {
+			return isShutdownInProgress(state.get());
+		}
+		
+		private boolean isShutdown(int state) {
+			return (state & SHUTDOWN_FLAG) == SHUTDOWN_FLAG;
+		}
+
+		private boolean isShutdownInProgress(int state) {
+			return (state & SHUTDOWN_IN_PROGRESS_FLAG) == SHUTDOWN_IN_PROGRESS_FLAG;
+		}
+		
+		/**
+		 * Attempts to add Thread {@code t} to the collection of threads.
+		 *  
+		 * @return {@code true} if the attempt is successful; 
+		 * {@code false} - if shutdown procedure has been already completed 
+		 * and {@link #isShutdown()} return {@code true}; in this case 
+		 * the caller is supposed to skip the actions it intended to do
+		 * and the call to {@link #removeThread(Thread)} is unnecessary.
+		 */
+		public boolean registerThread(Thread t) {
+			if (!isShutdown()) {
+				super.acquire(ADD_THREAD_ACTION);
+				try {
+					if (!isShutdown()) {
+						threads.add(t);
+						return true;
+					} else 
+						return false;
+				} finally {
+					super.release(ADD_THREAD_ACTION);
+				}
+			} else
+				return false;
+		}
+		
+		/**
+		 * Removes a Thread {@code t} from the collection of threads.
+		 *  
+		 * @return {@code true} if the attempt is successful; 
+		 * {@code false} - if shutdown procedure has been already completed 
+		 * and {@link #isShutdown()} return {@code true}; in this case 
+		 * the caller is supposed to skip the actions it intended to do
+		 * and the call to {@link #removeThread(Thread)} is unnecessary.
+		 */
+		public void deregisterThread(Thread t) {
+			super.acquire(REMOVE_THREAD_ACTION);
+			try {
+				threads.remove(t);
+			} finally {
+				super.release(REMOVE_THREAD_ACTION);
+			}
+		}
+		
+		/**
+		 * Shuts down Delayed Threads, calling {@link Thread#interrupt()}.
+		 * Does nothing if the shutdown procedure has been already completed 
+		 * and {@link #isShutdown()} return {@code true}.
+		 */
+		public void shutdown() {
+			if (!isShutdown()) {
+				super.acquire(SHUTDOWN_ACTION);
+				try {
+					if (isShutdown() && isShutdownInProgress()) {
+						threads.stream().forEach(t -> t.interrupt());
+					}
+				} finally {
+					super.release(SHUTDOWN_ACTION);
+				}
+			}
+		}
+		
+	}
+	
 	private final ExecutorService executorService;
 	private final DelayQueue<DelayedTask<?>> queue = new DelayQueue<>();
-	private final QueueReader queueReader;
-	private final AtomicBoolean shutdown = new AtomicBoolean(); 
+	private final SchedulerSync schedulerSync = new SchedulerSync();
 	
 	public ThreadPerTaskScheduledExecutorService() {
 		this(Executors.newVirtualThreadPerTaskExecutor());
@@ -62,8 +332,6 @@ public class ThreadPerTaskScheduledExecutorService implements ScheduledExecutorS
 	
 	public ThreadPerTaskScheduledExecutorService(ExecutorService executorService) {
 		this.executorService = executorService;
-		queueReader = new QueueReader();
-		queueReader.start();
 	}
 	
 	// ExecutorService
@@ -73,23 +341,26 @@ public class ThreadPerTaskScheduledExecutorService implements ScheduledExecutorS
 	}
 
 	public void shutdown() {
-		shutdownQueue();
+		shutdownScheduler();
 		executorService.shutdown();
 	}
 
 	public List<Runnable> shutdownNow() { 
-		shutdownQueue();
+		shutdownScheduler();
 		return executorService.shutdownNow();
 	}
 
-	private void shutdownQueue() {
-		if (shutdown.compareAndSet(false, true)) {
-			DelayedTask<?> task = null;
-			while ((task = queue.peek()) != null) {
-				queue.remove(task);
-				task.cancel(true);
-			}
-			queueReader.kill(); 
+	/**
+	 * Multi-threaded access to this method is allowed because 
+	 * {@link #queue} allows it and {@link #schedulerSync} synchronizes 
+	 * its {@link SchedulerSync#shutdown()} method.
+	 */
+	private void shutdownScheduler() {
+		schedulerSync.shutdown();
+		DelayedTask<?> task = null;
+		while ((task = queue.peek()) != null) {
+			queue.remove(task);
+			task.cancel(true);
 		}
 	}
 
@@ -144,8 +415,6 @@ public class ThreadPerTaskScheduledExecutorService implements ScheduledExecutorS
 	
 	private static class DelayedTask<V> extends FutureTask<V> implements ScheduledFuture<V> {
 		
-		public static final DelayedTask<Void> POISON_PILL = new DelayedTask<>();
-		
 		public enum PeriodicMode {
 			RATE,
 			DELAY,
@@ -156,13 +425,6 @@ public class ThreadPerTaskScheduledExecutorService implements ScheduledExecutorS
 		private final PeriodicMode periodicMode;
 		private final Consumer<DelayedTask<V>> enqueuer;
 		private volatile long triggerTime;
-		
-		private DelayedTask() {
-			super(() -> {return null;});
-			period = -1;
-			periodicMode = null;
-			enqueuer = null;
-		}
 		
 		public DelayedTask(Callable<V> callable, long triggerTime, Consumer<DelayedTask<V>> enqueuer) {
 			this(callable, triggerTime, -1, PeriodicMode.NONE, enqueuer);
@@ -212,43 +474,6 @@ public class ThreadPerTaskScheduledExecutorService implements ScheduledExecutorS
 		
 	}
 	
-	private class QueueReader extends Thread {
-		
-		public QueueReader() {
-			setDaemon(true);
-			setName(ThreadPerTaskScheduledExecutorService.class.getSimpleName() + " "
-					+ getClass().getSimpleName());
-		}
-		
-		@Override
-		public void run() {
-			while (true) {
-				try {
-					final DelayedTask<?> task = queue.take();
-					if (task == DelayedTask.POISON_PILL)
-						break;
-					else {
-						if (!shutdown.get())
-							submit(task);
-						else
-							task.cancel(true); 
-					}
-				} catch (InterruptedException e) {
-				}
-			}
-		}
-		
-		public void kill() {
-			queue.add(DelayedTask.POISON_PILL); 
-			try {
-				join();
-			} catch (InterruptedException e) {
-				Thread.currentThread().interrupt();
-			}
-		}
-		
-	}
-	
 	@Override
 	public ScheduledFuture<?> schedule(Runnable command, long delay, TimeUnit unit) {
 		return schedule(() -> {
@@ -279,9 +504,29 @@ public class ThreadPerTaskScheduledExecutorService implements ScheduledExecutorS
 	}
 	
 	private void enqueueTask(DelayedTask<?> task) {
-		if (shutdown.get())
+		if (schedulerSync.isShutdown())
 			throw new RejectedExecutionException("Service is shut down"); 
 		queue.add(task);
+		executorService.submit(() -> {
+			while (true) {
+				boolean delayedThreadAdded = false;
+				try {
+					delayedThreadAdded = schedulerSync.registerThread(Thread.currentThread());
+					if (delayedThreadAdded) {
+						final DelayedTask<?> readyTask = queue.take();
+						readyTask.run();
+					} 
+					break;
+				} catch (InterruptedException e) {
+					// ignore the interruptions, not caused by shutdown
+					if (schedulerSync.isShutdown())
+						break;
+				} finally {
+					if (delayedThreadAdded)
+						schedulerSync.deregisterThread(Thread.currentThread());					
+				}
+			}
+		});
 		
 	}
 	
